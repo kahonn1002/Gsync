@@ -28,7 +28,7 @@ Or run it directly: `/usr/bin/python3 gsync.py`
 ## 3. Connect Google Drive
 
 1. Click **Connect Google account**.
-2. Paste your own Google API client ID and secret, or leave them blank to keep using rclone's shared client for now. That shared client is being retired during 2026.
+2. Paste your own Google API client ID and secret ([how to make one](https://rclone.org/drive/#making-your-own-client-id)). Leaving them blank uses rclone's shared client, which Google throttles heavily (each sync stalls about 35 s on rate limits, even for a tiny folder) and which is being retired during 2026. Gsync shows a warning banner until you switch.
 3. Sign in to Google in the browser window that opens.
 4. The banner should change to "Connected to Google Drive."
 

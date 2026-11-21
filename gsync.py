@@ -65,6 +65,21 @@ def remote_configured():
     return f"{REMOTE}:" in out.split()
 
 
+def uses_shared_client():
+    """True when the Drive remote has no client_id of its own and so rides rclone's shared Google client.
+
+    That client's API quota is pooled across every rclone user, so Google answers with 403
+    rateLimitExceeded and rclone sleeps through exponential back-offs: about 35 s of idle waiting
+    before a sync even starts. Only a personal client ID removes that.
+    """
+    out = subprocess.run(["rclone", "config", "show", REMOTE], capture_output=True, text=True).stdout
+    for line in out.splitlines():  # the output also holds the token; read client_id only, log nothing
+        key, _, value = line.partition("=")
+        if key.strip() == "client_id":
+            return not value.strip()
+    return True
+
+
 EXTERNAL_ROOTS = ("/media", "/mnt", "/run/media")
 
 
@@ -129,10 +144,66 @@ def human(n):
     return f"{n:.1f} TB"
 
 
+def ago(ts):
+    if not ts:
+        return "never"
+    secs = time.time() - ts
+    if secs < 60:
+        return "just now"
+    if secs < 3600:
+        return f"{int(secs // 60)} min ago"
+    if secs < 86400:
+        return f"{int(secs // 3600)} h ago"
+    return time.strftime("%b %-d, %H:%M", time.localtime(ts))
+
+
+def pair_state(pair):
+    """Map a pair's stored status to (css state, icon, text shown under the rail)."""
+    s = pair.get("status", "")
+    if s.startswith("Syncing"):
+        return "busy", "emblem-synchronizing-symbolic", "Syncing…"
+    if s.startswith("Needs repair"):
+        return "warn", "dialog-warning-symbolic", "Needs repair"
+    if s.startswith("Blocked"):
+        return "err", "dialog-error-symbolic", "Blocked: unsafe folder"
+    if s.startswith("Error"):
+        return "err", "dialog-error-symbolic", s
+    if not pair.get("initialized"):
+        return "idle", "content-loading-symbolic", "Not synced yet"
+    if s == "Up to date":
+        return "ok", "emblem-ok-symbolic", f"Synced {ago(pair.get('last_sync'))}"
+    return "idle", "content-loading-symbolic", s
+
+
+STATES = ("ok", "busy", "warn", "err", "idle")
+
+CSS = b"""
+@define-color gs_ok #2f8a6c;
+@define-color gs_busy #4a78c2;
+@define-color gs_warn #b97c10;
+@define-color gs_err #c4473a;
+
+.pair-row { padding: 14px 10px 14px 18px; }
+.pair-title { font-size: 1.1em; font-weight: 600; }
+.pair-caption, .rail-text { font-size: 0.88em; }
+.rail-line { min-height: 2px; background-color: currentColor; opacity: 0.45; }
+.state-idle .rail-line { min-height: 0; background-color: transparent; border-top: 2px dashed currentColor; }
+.state-ok { color: @gs_ok; }
+.state-busy { color: @gs_busy; }
+.state-busy .rail-line { animation: gs-pulse 1.6s ease-in-out infinite; }
+.state-warn { color: @gs_warn; }
+.state-err { color: @gs_err; }
+.state-idle { color: alpha(@theme_fg_color, 0.5); }
+@keyframes gs-pulse { 0% { opacity: 0.85; } 50% { opacity: 0.15; } 100% { opacity: 0.85; } }
+.empty-title { font-size: 1.35em; font-weight: 600; }
+.activity { padding: 4px 6px; }
+"""
+
+
 class GsyncWindow(Gtk.ApplicationWindow):
     def __init__(self, app, background=False):
         super().__init__(application=app, title="Gsync")
-        self.set_default_size(820, 560)
+        self.set_default_size(780, 520)
         self.cfg = load_config()
         self.running = {}  # pair id -> Popen
         self.lock = threading.Lock()
@@ -152,66 +223,231 @@ class GsyncWindow(Gtk.ApplicationWindow):
 
     # ---------- UI ----------
     def _build_ui(self):
-        header = Gtk.HeaderBar(show_close_button=True, title="Gsync", subtitle="Google Drive two-way sync")
-        self.set_titlebar(header)
+        css = Gtk.CssProvider()
+        css.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            self.get_screen(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
 
-        self.btn_connect = Gtk.Button(label="Connect Google account")
-        self.btn_connect.connect("clicked", self._on_connect)
-        header.pack_start(self.btn_connect)
+        self.header = Gtk.HeaderBar(show_close_button=True, title="Gsync")
+        self.set_titlebar(self.header)
 
-        self.btn_pause = Gtk.ToggleButton(label="Pause")
+        add = Gtk.Button(tooltip_text="Sync a Drive folder with a folder on this computer")
+        add_box = Gtk.Box(spacing=6)
+        add_box.pack_start(Gtk.Image.new_from_icon_name("list-add-symbolic", Gtk.IconSize.BUTTON), False, False, 0)
+        add_box.pack_start(Gtk.Label(label="Add folder"), False, False, 0)
+        add.add(add_box)
+        add.get_style_context().add_class("suggested-action")
+        add.connect("clicked", self._on_add)
+        self.header.pack_start(add)
+
+        menu_btn = Gtk.MenuButton(tooltip_text="Settings")
+        menu_btn.add(Gtk.Image.new_from_icon_name("open-menu-symbolic", Gtk.IconSize.BUTTON))
+        menu_btn.set_popover(self._build_settings())
+        self.header.pack_end(menu_btn)
+
+        self.btn_pause = Gtk.ToggleButton()
+        self.pause_icon = Gtk.Image()
+        self.btn_pause.add(self.pause_icon)
         self.btn_pause.set_active(self.cfg["paused"])
         self.btn_pause.connect("toggled", self._on_pause)
-        header.pack_end(self.btn_pause)
+        self.header.pack_end(self.btn_pause)
+        self._update_pause_button()
 
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=12)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.add(box)
 
-        self.banner = Gtk.Label(xalign=0)
-        self.banner.set_line_wrap(True)
-        box.pack_start(self.banner, False, False, 0)
+        self.infobar = Gtk.InfoBar(revealed=False)
+        self.banner = Gtk.Label(xalign=0, wrap=True, selectable=True)
+        self.infobar.get_content_area().add(self.banner)
+        self.btn_connect = self.infobar.add_button("Connect Google account", 1)
+        self.btn_connect.set_no_show_all(True)
+        self.infobar.connect("response", lambda *_: self._on_connect(None))
+        box.pack_start(self.infobar, False, False, 0)
 
-        bar = Gtk.Box(spacing=6)
-        for label, handler in (
-            ("Add folder", self._on_add),
-            ("Sync now", self._on_sync_selected),
-            ("Repair (resync)", self._on_resync),
-            ("Remove", self._on_remove),
-        ):
-            b = Gtk.Button(label=label)
-            b.connect("clicked", handler)
-            bar.pack_start(b, False, False, 0)
-        box.pack_start(bar, False, False, 0)
+        self.stack = Gtk.Stack(vexpand=True, transition_type=Gtk.StackTransitionType.CROSSFADE)
+        box.pack_start(self.stack, True, True, 0)
 
-        self.store = Gtk.ListStore(str, str, str, str, str)  # id, drive, local, status, last
-        self.tree = Gtk.TreeView(model=self.store)
-        for i, title in ((1, "Drive folder"), (2, "Local folder"), (3, "Status"), (4, "Last sync")):
-            col = Gtk.TreeViewColumn(title, Gtk.CellRendererText(ellipsize=3), text=i)
-            col.set_resizable(True)
-            col.set_expand(i in (1, 2))
-            self.tree.append_column(col)
-        sw = Gtk.ScrolledWindow(min_content_height=140)
-        sw.add(self.tree)
-        box.pack_start(sw, True, True, 0)
+        self.listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.listbox.set_header_func(
+            lambda row, before: row.set_header(Gtk.Separator() if before else None)
+        )
+        frame = Gtk.Frame(margin=18, valign=Gtk.Align.START)
+        frame.add(self.listbox)
+        sw = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        sw.add(frame)
+        self.stack.add_named(sw, "pairs")
+        self.stack.add_named(self._build_empty(), "empty")
+        self.rows = {}  # pair id -> widgets of its row
 
-        settings = Gtk.Box(spacing=12)
-        settings.pack_start(Gtk.Label(label="Sync every"), False, False, 0)
+        self.activity = Gtk.Expander(label="Activity", margin_start=18, margin_end=18, margin_bottom=12)
+        self.log = Gtk.TextView(editable=False, monospace=True, cursor_visible=False, top_margin=6,
+                                bottom_margin=6, left_margin=8, right_margin=8)
+        self.log.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        lsw = Gtk.ScrolledWindow(min_content_height=170, margin_top=6, shadow_type=Gtk.ShadowType.IN)
+        lsw.add(self.log)
+        self.activity.add(lsw)
+        box.pack_start(self.activity, False, False, 0)
+
+    def _build_settings(self):
+        pop = Gtk.Popover()
+        grid = Gtk.Grid(row_spacing=10, column_spacing=12, margin=14)
+        pop.add(grid)
+        grid.attach(Gtk.Label(label="Sync every", xalign=0), 0, 0, 1, 1)
+        every = Gtk.Box(spacing=6)
         self.spin = Gtk.SpinButton.new_with_range(1, 1440, 1)
         self.spin.set_value(self.cfg["interval_min"])
         self.spin.connect("value-changed", self._on_interval)
-        settings.pack_start(self.spin, False, False, 0)
-        settings.pack_start(Gtk.Label(label="minutes"), False, False, 0)
-        self.sw_auto = Gtk.Switch(active=os.path.exists(AUTOSTART_FILE), valign=Gtk.Align.CENTER)
+        every.pack_start(self.spin, False, False, 0)
+        every.pack_start(Gtk.Label(label="min"), False, False, 0)
+        grid.attach(every, 1, 0, 1, 1)
+        grid.attach(Gtk.Label(label="Start at login", xalign=0), 0, 1, 1, 1)
+        self.sw_auto = Gtk.Switch(active=os.path.exists(AUTOSTART_FILE), halign=Gtk.Align.END)
         self.sw_auto.connect("notify::active", self._on_autostart)
-        settings.pack_end(self.sw_auto, False, False, 0)
-        settings.pack_end(Gtk.Label(label="Start at login"), False, False, 0)
-        box.pack_start(settings, False, False, 0)
+        grid.attach(self.sw_auto, 1, 1, 1, 1)
+        grid.attach(Gtk.Separator(), 0, 2, 2, 1)
+        for row, (label, fn) in enumerate(
+            (("Sync all now", lambda *_: self._sync_all()),
+             ("Reconnect Google account", self._on_connect)), start=3
+        ):
+            b = Gtk.ModelButton(text=label)
+            b.get_child().set_halign(Gtk.Align.START)
+            b.connect("clicked", fn)
+            grid.attach(b, 0, row, 2, 1)
+        grid.show_all()
+        return pop
 
-        self.log = Gtk.TextView(editable=False, monospace=True, cursor_visible=False)
-        self.log.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        lsw = Gtk.ScrolledWindow(min_content_height=180)
-        lsw.add(self.log)
-        box.pack_start(lsw, True, True, 0)
+    def _build_empty(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                      halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+        icon = Gtk.Image.new_from_icon_name("folder-remote-symbolic", Gtk.IconSize.DIALOG)
+        icon.set_pixel_size(64)
+        icon.get_style_context().add_class("dim-label")
+        box.pack_start(icon, False, False, 0)
+        title = Gtk.Label(label="No folders synced yet")
+        title.get_style_context().add_class("empty-title")
+        box.pack_start(title, False, False, 0)
+        text = Gtk.Label(label="Pick a Drive folder and a folder on this computer,\nand Gsync keeps them the same.",
+                         justify=Gtk.Justification.CENTER)
+        text.get_style_context().add_class("dim-label")
+        box.pack_start(text, False, False, 0)
+        btn = Gtk.Button(label="Add folder", halign=Gtk.Align.CENTER, margin_top=8)
+        btn.get_style_context().add_class("suggested-action")
+        btn.connect("clicked", self._on_add)
+        box.pack_start(btn, False, False, 0)
+        return box
+
+    def _endpoint(self, caption, align):
+        """One side of a pair: a folder name over a small caption."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True, valign=Gtk.Align.CENTER)
+        title = Gtk.Label(xalign=align, ellipsize=3, width_chars=8, max_width_chars=8)
+        title.get_style_context().add_class("pair-title")
+        cap = Gtk.Label(label=caption, xalign=align, ellipsize=2, width_chars=8, max_width_chars=8)
+        cap.get_style_context().add_class("pair-caption")
+        cap.get_style_context().add_class("dim-label")
+        box.pack_start(title, False, False, 0)
+        box.pack_start(cap, False, False, 0)
+        return box, title, cap
+
+    def _make_row(self, pair):
+        row = Gtk.ListBoxRow(activatable=False, selectable=False)
+        grid = Gtk.Grid(column_spacing=18)
+        grid.get_style_context().add_class("pair-row")
+        row.add(grid)
+
+        drive, d_title, d_cap = self._endpoint("Google Drive", 0)
+        local, l_title, l_cap = self._endpoint("", 1)
+
+        rail = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, valign=Gtk.Align.CENTER)
+        rail.set_size_request(150, -1)
+        line = Gtk.Box(spacing=8)
+        for w in (Gtk.Box(hexpand=True, valign=Gtk.Align.CENTER), None, Gtk.Box(hexpand=True, valign=Gtk.Align.CENTER)):
+            if w is None:
+                icon = Gtk.Image()
+                line.pack_start(icon, False, False, 0)
+            else:
+                w.get_style_context().add_class("rail-line")
+                line.pack_start(w, True, True, 0)
+        text = Gtk.Label(ellipsize=3, max_width_chars=22)
+        text.get_style_context().add_class("rail-text")
+        rail.pack_start(line, False, False, 0)
+        rail.pack_start(text, False, False, 0)
+
+        actions = Gtk.Box(spacing=2, valign=Gtk.Align.CENTER)
+        sync = Gtk.Button(tooltip_text="Sync now", relief=Gtk.ReliefStyle.NONE)
+        sync.add(Gtk.Image.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON))
+        sync.connect("clicked", lambda *_: self._start_sync(pair))
+        more = Gtk.MenuButton(tooltip_text="More actions", relief=Gtk.ReliefStyle.NONE)
+        more.add(Gtk.Image.new_from_icon_name("view-more-symbolic", Gtk.IconSize.BUTTON))
+        pop = Gtk.Popover()
+        pbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, margin=6)
+        for label, fn in (("Open folder on this computer", self._on_open_local),
+                          ("Repair…", self._on_resync),
+                          ("Stop syncing…", self._on_remove)):
+            b = Gtk.ModelButton(text=label)
+            b.get_child().set_halign(Gtk.Align.START)
+            b.connect("clicked", lambda _b, fn=fn: fn(pair))
+            pbox.pack_start(b, False, False, 0)
+        pbox.show_all()
+        pop.add(pbox)
+        more.set_popover(pop)
+        actions.pack_start(sync, False, False, 0)
+        actions.pack_start(more, False, False, 0)
+
+        for col, w in enumerate((drive, rail, local, actions)):
+            grid.attach(w, col, 0, 1, 1)
+        row.show_all()
+        return {"row": row, "d_title": d_title, "d_cap": d_cap, "l_title": l_title,
+                "l_cap": l_cap, "rail": rail, "icon": icon, "text": text, "sync": sync}
+
+    def _update_row(self, w, pair):
+        remote = pair["remote_path"]
+        parent, _, name = remote.rpartition("/")
+        w["d_title"].set_text(name or "My Drive")
+        w["d_cap"].set_text("Google Drive" + (f" / {parent}" if parent else ""))
+        w["d_title"].set_tooltip_text(f"Drive: {remote or 'My Drive (everything)'}")
+        home = os.path.expanduser("~")
+        local = pair["local_path"]
+        folder, name = os.path.split(local)
+        w["l_title"].set_text(name)
+        w["l_cap"].set_text("~" + folder[len(home):] if folder == home or folder.startswith(home + "/") else folder)
+        w["l_title"].set_tooltip_text(local)
+        state, icon, text = pair_state(pair)
+        ctx = w["rail"].get_style_context()
+        for s in STATES:
+            ctx.remove_class(f"state-{s}")
+        ctx.add_class(f"state-{state}")
+        w["icon"].set_from_icon_name(icon, Gtk.IconSize.BUTTON)
+        w["text"].set_text(text)
+        last = f"Last successful sync: {ago(pair.get('last_sync'))}"
+        w["rail"].set_tooltip_text(f"{pair['status']}\n{last}")
+        w["sync"].set_sensitive(state != "busy")
+
+    def _update_pause_button(self):
+        paused = self.btn_pause.get_active()
+        self.pause_icon.set_from_icon_name(
+            "media-playback-start-symbolic" if paused else "media-playback-pause-symbolic", Gtk.IconSize.BUTTON
+        )
+        self.btn_pause.set_tooltip_text("Resume auto-sync" if paused else "Pause auto-sync")
+
+    def _update_summary(self):
+        pairs = self.cfg["pairs"]
+        states = [pair_state(p)[0] for p in pairs]
+        trouble = states.count("err") + states.count("warn")
+        if not pairs:
+            text = "Google Drive two-way sync"
+        elif states.count("busy"):
+            n = states.count("busy")
+            text = f"Syncing {n} folder{'s' if n > 1 else ''}"
+        elif trouble:
+            text = f"{trouble} folder{'s need' if trouble > 1 else ' needs'} attention"
+        elif self.cfg["paused"]:
+            text = "Auto-sync paused"
+        elif all(s == "ok" for s in states):
+            text = "Everything is up to date"
+        else:
+            text = f"{len(pairs)} folder{'s' if len(pairs) > 1 else ''}"
+        self.header.set_subtitle(text)
 
     def _build_tray(self, app):
         if AppIndicator is None:
@@ -255,17 +491,18 @@ class GsyncWindow(Gtk.ApplicationWindow):
         GLib.idle_add(add)
 
     def _refresh_pairs(self):
-        self.store.clear()
+        ids = [p["id"] for p in self.cfg["pairs"]]
+        if ids != list(self.rows):
+            for w in self.rows.values():
+                self.listbox.remove(w["row"])
+            self.rows = {}
+            for p in self.cfg["pairs"]:
+                self.rows[p["id"]] = self._make_row(p)
+                self.listbox.add(self.rows[p["id"]]["row"])
         for p in self.cfg["pairs"]:
-            last = time.strftime("%Y-%m-%d %H:%M", time.localtime(p["last_sync"])) if p.get("last_sync") else "never"
-            self.store.append([p["id"], p["remote_path"] or "(My Drive root)", p["local_path"], p["status"], last])
-
-    def _selected(self):
-        model, it = self.tree.get_selection().get_selected()
-        if not it:
-            return None
-        pid = model[it][0]
-        return next((p for p in self.cfg["pairs"] if p["id"] == pid), None)
+            self._update_row(self.rows[p["id"]], p)
+        self.stack.set_visible_child_name("pairs" if ids else "empty")
+        self._update_summary()
 
     def _message(self, text, kind=Gtk.MessageType.INFO):
         d = Gtk.MessageDialog(transient_for=self, message_type=kind, buttons=Gtk.ButtonsType.OK, text=text)
@@ -301,23 +538,38 @@ class GsyncWindow(Gtk.ApplicationWindow):
     # ---------- setup ----------
     def _check_setup(self):
         ver = rclone_version()
+        self.btn_connect.set_label("Connect Google account")
+        self.btn_connect.set_visible(False)
         if ver is None:
+            self.infobar.set_message_type(Gtk.MessageType.ERROR)
             self.banner.set_markup(
                 "<b>rclone is not installed.</b> Install the latest release with:\n"
                 "<tt>curl https://rclone.org/install.sh | sudo bash</tt>"
             )
-            self.btn_connect.set_sensitive(False)
         elif ver < MIN_RCLONE:
+            self.infobar.set_message_type(Gtk.MessageType.WARNING)
             self.banner.set_markup(
-                f"<b>rclone {'.'.join(map(str, ver))} is too old for reliable bisync</b> "
-                f"(need {'.'.join(map(str, MIN_RCLONE))}+). Update with:\n"
+                f"<b>rclone {'.'.join(map(str, ver))} is too old for reliable sync</b> "
+                f"(need {'.'.join(map(str, MIN_RCLONE))} or newer). Update with:\n"
                 "<tt>curl https://rclone.org/install.sh | sudo bash</tt>"
             )
         elif not remote_configured():
-            self.banner.set_text("Click “Connect Google account” to sign in to Google Drive.")
+            self.infobar.set_message_type(Gtk.MessageType.INFO)
+            self.banner.set_text("Sign in to Google Drive to start syncing.")
+            self.btn_connect.set_visible(True)
+        elif uses_shared_client():
+            self.infobar.set_message_type(Gtk.MessageType.WARNING)
+            self.banner.set_text(
+                "Syncing is slow because Gsync is using rclone's shared Google client. Google throttles "
+                "it heavily (every sync waits about 35 s on rate limits) and it is being retired during "
+                "2026. Create your own client ID to fix both."
+            )
+            self.btn_connect.set_label("Use my own client ID")
+            self.btn_connect.set_visible(True)
         else:
-            self.banner.set_text("Connected to Google Drive.")
-            self.btn_connect.set_label("Reconnect account")
+            self.infobar.set_revealed(False)
+            return
+        self.infobar.set_revealed(True)
 
     def _ask_client_id(self):
         """Return (client_id, client_secret), ("", "") to skip, or None if cancelled."""
@@ -564,10 +816,14 @@ class GsyncWindow(Gtk.ApplicationWindow):
         d.destroy()
         return chosen if resp == Gtk.ResponseType.OK else None
 
-    def _on_remove(self, _btn):
-        p = self._selected()
-        if not p:
+    def _on_open_local(self, pair):
+        path = pair["local_path"]
+        if not os.path.isdir(path):
+            self._message(f"{path} doesn't exist yet. It is created on the first sync.")
             return
+        Gtk.show_uri_on_window(self, GLib.filename_to_uri(path, None), Gtk.get_current_event_time())
+
+    def _on_remove(self, p):
         if not self._confirm("Stop syncing this folder?", "Files on Drive and on disk are left untouched."):
             return
         proc = self.running.get(p["id"])
@@ -577,15 +833,9 @@ class GsyncWindow(Gtk.ApplicationWindow):
         save_config(self.cfg)
         self._refresh_pairs()
 
-    def _on_sync_selected(self, _btn):
-        p = self._selected()
-        if p:
-            self._start_sync(p)
-
-    def _on_resync(self, _btn):
-        p = self._selected()
-        if p and self._confirm(
-            "Rebuild sync state?",
+    def _on_resync(self, p):
+        if self._confirm(
+            "Repair this folder?",
             "Runs a full resync. Files missing on one side are copied over; the Drive copy wins "
             "when both sides differ. Nothing is deleted.",
         ):
@@ -597,6 +847,7 @@ class GsyncWindow(Gtk.ApplicationWindow):
             self._start_sync(p)
 
     def _tick(self):
+        self._refresh_pairs()  # keeps "Synced 5 min ago" current
         if self.cfg["paused"] or not shutil.which("rclone"):
             return True
         now = time.time()
@@ -612,6 +863,8 @@ class GsyncWindow(Gtk.ApplicationWindow):
                 pair["last_sync"] = time.time()
             save_config(self.cfg)
             self._refresh_pairs()
+            if pair_state(pair)[0] in ("err", "warn"):
+                self.activity.set_expanded(True)  # show the rclone output that explains it
         GLib.idle_add(apply)
 
     def _start_sync(self, pair, resync=False):
@@ -638,6 +891,9 @@ class GsyncWindow(Gtk.ApplicationWindow):
                 "rclone", "bisync", f"{REMOTE}:{pair['remote_path']}", pair["local_path"],
                 "--create-empty-src-dirs", "--drive-skip-gdocs", "--resilient",
                 "--conflict-resolve", "newer", "--conflict-loser", "num", "-v",
+                # bisync lists Drive one folder at a time; on a 400-folder tree that was 474 API
+                # requests per sync vs 30 with --fast-list (same listing, far fewer rate-limit stalls).
+                "--fast-list",
             ]
             if resync or not pair["initialized"]:
                 cmd += ["--resync"]  # default resync mode: Path1 (Drive) wins on differences
@@ -668,6 +924,8 @@ class GsyncWindow(Gtk.ApplicationWindow):
     def _on_pause(self, btn):
         self.cfg["paused"] = btn.get_active()
         save_config(self.cfg)
+        self._update_pause_button()
+        self._update_summary()
         self.log_line("Auto-sync paused." if self.cfg["paused"] else "Auto-sync resumed.")
 
     def _on_interval(self, spin):
