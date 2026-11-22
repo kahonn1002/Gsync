@@ -1,5 +1,4 @@
 """macOS-specific pieces of Gsync. gsync.py imports this only when sys.platform == "darwin"."""
-import ctypes
 import fcntl
 import os
 import plistlib
@@ -39,6 +38,26 @@ def fix_path():
     os.environ["PATH"] = ":".join(parts)
 
 
+def app_executable():
+    """Path of Gsync.app's launcher when this process is the app (see mac_launcher.c), else None."""
+    exe = os.path.realpath(sys.executable)
+    return exe if exe.endswith(".app/Contents/MacOS/Gsync") else None
+
+
+def redirect_output():
+    """Started from Finder, the Dock or at login, output would go nowhere; keep it in a log file.
+    os.dup2 also catches GTK and GLib warnings, which C code writes straight to fd 2."""
+    if sys.stderr is not None and sys.stderr.isatty():
+        return
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+    fd = os.open(LOG_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    for target in (1, 2):
+        os.dup2(fd, target)
+    os.close(fd)
+    sys.stdout = open(1, "w", buffering=1, closefd=False)
+    sys.stderr = open(2, "w", buffering=1, closefd=False)
+
+
 def fold(path):
     """APFS is case-insensitive and normalization-insensitive by default, so compare paths that way.
     Folding only ever makes the safety checks stricter, never looser."""
@@ -60,22 +79,6 @@ def home_path_problem(rel):
         return ("iCloud already syncs your Desktop and Documents folders. Syncing them with Drive "
                 "too leads to conflicts; use a folder such as ~/GDrive/<name>.")
     return None
-
-
-def activate_app():
-    """Bring Gsync in front of other apps. GTK's present() raises the window inside Gsync but does
-    not activate the app, so it stays behind whatever app is in front. AppKit is already loaded by
-    GTK's Quartz backend, so a direct [NSApp activateIgnoringOtherApps:YES] is enough."""
-    try:
-        objc = ctypes.cdll.LoadLibrary("/usr/lib/libobjc.A.dylib")
-        objc.objc_getClass.restype = objc.sel_registerName.restype = ctypes.c_void_p
-        send = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(("objc_msgSend", objc))
-        send_bool = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool)(("objc_msgSend", objc))
-        app = send(objc.objc_getClass(b"NSApplication"), objc.sel_registerName(b"sharedApplication"))
-        if app:
-            send_bool(app, objc.sel_registerName(b"activateIgnoringOtherApps:"), True)
-    except (OSError, AttributeError):
-        pass  # cosmetic: the window is still raised, just maybe behind another app
 
 
 _instance = {}  # keeps the lock file and listening socket alive for the life of the process
@@ -150,9 +153,11 @@ def set_autostart(enabled, script):
         if os.path.exists(LAUNCH_AGENT):
             os.remove(LAUNCH_AGENT)
         return
+    app = app_executable()
     plist = {
         "Label": LABEL,
-        "ProgramArguments": [python_for_launch(), os.path.abspath(script), "--background"],
+        "ProgramArguments": [app, "--background"] if app else
+                            [python_for_launch(), os.path.abspath(script), "--background"],
         "RunAtLoad": True,
         "LimitLoadToSessionType": "Aqua",  # only in a logged-in GUI session
         "ProcessType": "Interactive",
@@ -162,6 +167,8 @@ def set_autostart(enabled, script):
         "StandardOutPath": LOG_FILE,
         "StandardErrorPath": LOG_FILE,
     }
+    if app:  # Login Items in System Settings then shows "Gsync" and its icon, not "python3"
+        plist["AssociatedBundleIdentifiers"] = ["local.gsync"]
     os.makedirs(os.path.dirname(LAUNCH_AGENT), exist_ok=True)
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
     tmp = LAUNCH_AGENT + ".tmp"

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Installs Gsync on macOS: checks the Homebrew packages and adds ~/Applications/Gsync.app
-# (a small launcher for gsync.py in this folder; rerun this script if you move the folder).
+# (an app that runs gsync.py from this folder; rerun this script if you move the folder).
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -30,20 +30,49 @@ if ! "$PY" -c 'import gi; gi.require_version("Gtk", "3.0"); from gi.repository i
   exit 1
 fi
 
-# The launcher is a tiny AppleScript applet: macOS 26 refuses to open a bundle whose executable is
-# a shell script (LaunchServices error -10669), but an osacompile applet is a normal app. It starts
-# gsync.py in the background and exits; Gsync then shows in the Dock as "Python".
-as_str() { local s="${1//\\/\\\\}"; printf '"%s"' "${s//\"/\\\"}"; }  # AppleScript string literal
-LOG="$HOME/Library/Logs/gsync.log"
+# Gsync.app runs gsync.py inside its own process (see mac_launcher.c), so macOS shows it as Gsync
+# with its own icon, notifications and privacy prompts, rather than as "Python".
+case "$DIR" in *\"*|*\\*)
+  echo "Move this folder to a path without \" or \\ in it, then run this script again." >&2; exit 1;;
+esac
+if ! xcrun --find clang >/dev/null 2>&1; then
+  echo "The app launcher needs Apple's command line tools. Run:  xcode-select --install" >&2
+  exit 1
+fi
 APP="$HOME/Applications/Gsync.app"
-mkdir -p "$HOME/Applications" "$(dirname "$LOG")"
+BUILD="$(mktemp -d)"
+trap 'rm -rf "$BUILD"' EXIT
+mkdir -p "$BUILD/Gsync.app/Contents/MacOS" "$BUILD/Gsync.app/Contents/Resources"
+xcrun clang -O2 -Wall -Werror -framework CoreFoundation -Wl,-rpath,"$PREFIX/lib" \
+  -DPYTHON_LIB="\"$PREFIX/opt/python3/Frameworks/Python.framework/Versions/Current/Python\"" \
+  -DGSYNC_SCRIPT="\"$DIR/gsync.py\"" \
+  "$DIR/mac_launcher.c" -o "$BUILD/Gsync.app/Contents/MacOS/Gsync"
+"$PY" "$DIR/mac_icons.py" "$BUILD/Gsync.iconset"
+iconutil -c icns "$BUILD/Gsync.iconset" -o "$BUILD/Gsync.app/Contents/Resources/Gsync.icns"
+cat > "$BUILD/Gsync.app/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>Gsync</string>
+  <key>CFBundleDisplayName</key><string>Gsync</string>
+  <key>CFBundleIdentifier</key><string>local.gsync</string>
+  <key>CFBundleExecutable</key><string>Gsync</string>
+  <key>CFBundleIconFile</key><string>Gsync</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
+  <key>LSMinimumSystemVersion</key><string>12.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+PLIST
+codesign --force --sign - "$BUILD/Gsync.app"  # ad-hoc: Apple silicon only runs signed code
+mkdir -p "$HOME/Applications"
 rm -rf "$APP"
-osacompile -o "$APP" \
-  -e "set py to $(as_str "$PY")" \
-  -e "set gsyncScript to $(as_str "$DIR/gsync.py")" \
-  -e "set logFile to $(as_str "$LOG")" \
-  -e "set binPath to $(as_str "$PREFIX/bin:/usr/bin:/bin:/usr/sbin:/sbin")" \
-  -e 'do shell script "export PATH=" & quoted form of binPath & "; " & quoted form of py & " " & quoted form of gsyncScript & " >> " & quoted form of logFile & " 2>&1 &"'
+mv "$BUILD/Gsync.app" "$APP"
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP"
 chmod +x "$DIR/gsync.py"
 
 echo "Installed $APP"

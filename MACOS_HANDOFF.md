@@ -64,5 +64,13 @@ Delete this file before merging `macos` into `main`.
   executables with LaunchServices error -10669) and `MACOS_TESTING.md`.
 - [ ] Phase 3 safe first sync with a real Drive account: the user does this with their own client ID.
   Checklist in `MACOS_TESTING.md`.
-- [ ] For `main`: the empty-state page stays blank until the first 30 s tick (`Gtk.Stack` ignores
-  `set_visible_child_name` before `show_all`). Affects Linux too.
+- [x] For `main` (merged into `macos`): empty-state page shown at startup (stack pages shown when built),
+  `--color NEVER` for a readable Activity log, and icon fallbacks for Adwaita 51.
+- [x] User tested a real sync on the Mac (pair `ardeecarpet`), 2026-11-22.
+- [x] Phase 5 (2026-11-22): native menu-bar item (`mac_menubar.py`, NSStatusItem through ctypes in
+  `mac_objc.py`; Gtk.StatusIcon can't do template images or a native menu), notifications
+  (`mac_notify.py`, UserNotifications inside the bundle, osascript otherwise), sync on local changes
+  (`mac_watch.py`, FSEvents, 20 s quiet / 2 min cap), and a real `Gsync.app` (`mac_launcher.c` embeds
+  Homebrew Python through `opt/python3/.../Versions/Current`, rpath `/opt/homebrew/lib` so GI finds
+  libgobject; icon from `mac_icons.py`). `mac_app.py` ties these to the window.
+  Not verified by real clicks or keypresses: Terminal has no Accessibility permission. Checklist in `MACOS_TESTING.md`.

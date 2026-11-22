@@ -17,9 +17,12 @@ from gi.repository import GLib, Gtk  # noqa: E402
 
 MAC = sys.platform == "darwin"
 if MAC:
+    import mac_app  # noqa: E402
     import platform_mac  # noqa: E402
 
     platform_mac.fix_path()
+    if platform_mac.app_executable():  # started as Gsync.app: no terminal to print to
+        platform_mac.redirect_output()
 
 APP = "gsync"
 CFG_DIR = os.path.join(GLib.get_user_config_dir(), APP)
@@ -231,24 +234,24 @@ class GsyncWindow(Gtk.ApplicationWindow):
         self.lock = threading.Lock()
         self.indicator = None
         self.quitting = False
+        self.mac = None
 
         self._build_ui()
         self._refresh_pairs()
         self._check_setup()
         self._build_tray(app)
-        if MAC:  # closing the window only minimizes it, so give quitting a real shortcut
-            accel = Gtk.AccelGroup()
-            key, mods = Gtk.accelerator_parse("<Primary>q")  # <Primary> is ⌘ on macOS
-            accel.connect(key, mods, 0, lambda *_: self._quit() or True)
-            self.add_accel_group(accel)
-            platform_mac.show_handlers.append(
-                lambda: (self.deiconify(), self.present(), platform_mac.activate_app()))
+        if MAC:  # menu-bar item, Dock icon, notifications, syncing on local changes, ⌘Q
+            self.mac = mac_app.MacExtras(self, pair_state)
+            self._update_summary()
 
         GLib.timeout_add_seconds(30, self._tick)
         self.connect("delete-event", self._on_close)
-        if background:
-            self.iconify()
-        self.show_all()
+        if background and self.mac and self.mac.menubar:
+            self.mac.start_hidden()  # run from the menu bar; the window opens from there
+        else:
+            if background:
+                self.iconify()
+            self.show_all()
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -483,6 +486,8 @@ class GsyncWindow(Gtk.ApplicationWindow):
         else:
             text = f"{len(pairs)} folder{'s' if len(pairs) > 1 else ''}"
         self.header.set_subtitle(text)
+        if self.mac:
+            self.mac.refresh(text)
 
     def _build_tray(self, app):
         if AppIndicator is None:
@@ -504,8 +509,8 @@ class GsyncWindow(Gtk.ApplicationWindow):
         self.indicator.set_menu(menu)
 
     def _on_close(self, *_):
-        if MAC and not self.quitting:
-            self.iconify()  # no tray on macOS: park in the Dock and keep syncing; quit with ⌘Q
+        if self.mac and not self.quitting:
+            self.mac.close_window()  # keep syncing from the menu bar (or the Dock)
             return True
         if self.indicator and not self.quitting:
             self.hide()  # keep syncing in the background
@@ -903,6 +908,8 @@ class GsyncWindow(Gtk.ApplicationWindow):
             self._refresh_pairs()
             if pair_state(pair)[0] in ("err", "warn"):
                 self.activity.set_expanded(True)  # show the rclone output that explains it
+            if self.mac:
+                self.mac.status_changed(pair)
         GLib.idle_add(apply)
 
     def _start_sync(self, pair, resync=False):
@@ -941,12 +948,16 @@ class GsyncWindow(Gtk.ApplicationWindow):
             self.log_line(f"== {name} ==")
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             self.running[pair["id"]] = proc
-            tail = []
+            tail, conflicts = [], []
             for line in proc.stdout:
                 self.log_line(line)
                 tail.append(line)
                 tail = tail[-30:]
+                if "New or changed in both paths" in line:  # bisync keeps the newer copy
+                    conflicts.append(line.rsplit(" - ", 1)[-1].strip())
             code = proc.wait()
+            if conflicts and self.mac:
+                GLib.idle_add(self.mac.conflicts, pair, conflicts)
             if code == 0:
                 pair["initialized"] = True
                 self._set_status(pair, "Up to date", ok=True)
