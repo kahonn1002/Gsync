@@ -189,6 +189,15 @@ def pair_state(pair):
 
 
 STATES = ("ok", "busy", "warn", "err", "idle")
+# Newer Adwaita (e.g. 51, as shipped by Homebrew) dropped these; use the closest icon that exists.
+ICON_FALLBACKS = {"emblem-ok-symbolic": "object-select-symbolic",
+                  "emblem-synchronizing-symbolic": "view-refresh-symbolic"}
+
+
+def icon_name(name):
+    if not Gtk.IconTheme.get_default().has_icon(name):
+        return ICON_FALLBACKS.get(name, name)
+    return name
 
 CSS = b"""
 @define-color gs_ok #2f8a6c;
@@ -442,7 +451,7 @@ class GsyncWindow(Gtk.ApplicationWindow):
         for s in STATES:
             ctx.remove_class(f"state-{s}")
         ctx.add_class(f"state-{state}")
-        w["icon"].set_from_icon_name(icon, Gtk.IconSize.BUTTON)
+        w["icon"].set_from_icon_name(icon_name(icon), Gtk.IconSize.BUTTON)
         w["text"].set_text(text)
         last = f"Last successful sync: {ago(pair.get('last_sync'))}"
         w["rail"].set_tooltip_text(f"{pair['status']}\n{last}")
@@ -919,6 +928,7 @@ class GsyncWindow(Gtk.ApplicationWindow):
                 "rclone", "bisync", f"{REMOTE}:{pair['remote_path']}", pair["local_path"],
                 "--create-empty-src-dirs", "--drive-skip-gdocs", "--resilient",
                 "--conflict-resolve", "newer", "--conflict-loser", "num", "-v",
+                "--color", "NEVER",  # bisync colours its log even into a pipe; keep Activity readable
                 # bisync lists Drive one folder at a time; on a 400-folder tree that was 474 API
                 # requests per sync vs 30 with --fast-list (same listing, far fewer rate-limit stalls).
                 "--fast-list",
