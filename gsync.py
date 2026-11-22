@@ -249,9 +249,6 @@ class GsyncWindow(Gtk.ApplicationWindow):
         if background:
             self.iconify()
         self.show_all()
-        # Gtk.Stack ignores set_visible_child_name() for children that aren't shown yet, so the
-        # choice made by _refresh_pairs() above only takes effect now that show_all() has run.
-        self.stack.set_visible_child_name("pairs" if self.cfg["pairs"] else "empty")
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -310,6 +307,10 @@ class GsyncWindow(Gtk.ApplicationWindow):
         sw.add(frame)
         self.stack.add_named(sw, "pairs")
         self.stack.add_named(self._build_empty(), "empty")
+        # Gtk.Stack ignores set_visible_child_name() for pages that aren't visible yet; show them
+        # now so _refresh_pairs() can pick the right page before the window first appears.
+        for page in self.stack.get_children():
+            page.show_all()
         self.rows = {}  # pair id -> widgets of its row
 
         self.activity = Gtk.Expander(label="Activity", margin_start=18, margin_end=18, margin_bottom=12)
