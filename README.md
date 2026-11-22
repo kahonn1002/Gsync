@@ -28,6 +28,16 @@ Gsync doesn't have its own sync engine. It runs `rclone bisync`, so what it adds
 - It is as reliable as `rclone bisync`. Check rclone's own documentation for the current limits of that command.
 - [Insync](https://www.insynchq.com) is a paid app that does similar things. Gsync is a smaller, free alternative that you run from source, and it has had far less testing.
 
+## Screenshots
+
+![Gsync main window with three synced folder pairs](docs/main-window.png)
+
+The main window lists each pair as Drive folder, status and local folder. Pause, sync now and per-pair options are on the right.
+
+![Add sync folder dialog](docs/add-folder-dialog.png)
+
+**Add folder** asks for a Drive folder (blank means the whole Drive) and a local folder. Use a new or empty local folder, since everything inside it is copied to Drive.
+
 ## Requirements
 
 | | Linux | macOS |
