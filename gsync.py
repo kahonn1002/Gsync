@@ -15,12 +15,20 @@ import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import GLib, Gtk  # noqa: E402
 
+MAC = sys.platform == "darwin"
+if MAC:
+    import platform_mac  # noqa: E402
+
+    platform_mac.fix_path()
+
 APP = "gsync"
 CFG_DIR = os.path.join(GLib.get_user_config_dir(), APP)
 CFG_FILE = os.path.join(CFG_DIR, "config.json")
 AUTOSTART_FILE = os.path.join(GLib.get_user_config_dir(), "autostart", "gsync.desktop")
 REMOTE = "gdrive"
 MIN_RCLONE = (1, 66, 0)  # --conflict-resolve / --resilient need a recent bisync
+
+INSTALL_RCLONE = platform_mac.INSTALL_RCLONE if MAC else "curl https://rclone.org/install.sh | sudo bash"
 
 DEFAULTS = {"interval_min": 10, "paused": False, "pairs": []}
 
@@ -80,19 +88,22 @@ def uses_shared_client():
     return True
 
 
-EXTERNAL_ROOTS = ("/media", "/mnt", "/run/media")
+EXTERNAL_ROOTS = platform_mac.EXTERNAL_ROOTS if MAC else ("/media", "/mnt", "/run/media")
 
 
 def local_path_problem(path):
     """Return why `path` must not be synced, or None if it looks safe."""
     home = os.path.realpath(os.path.expanduser("~"))
     path = os.path.realpath(path)
+    if MAC:  # case- and normalization-insensitive filesystem
+        home, path = platform_mac.fold(home), platform_mac.fold(path)
     if path == home or home.startswith(path.rstrip("/") + "/"):
         return "That is your home folder (or contains it). Use a dedicated folder such as ~/GDrive/<name>."
     if path.startswith(home + "/"):
-        if os.path.relpath(path, home).split("/")[0].startswith("."):
+        rel = os.path.relpath(path, home)
+        if rel.split("/")[0].startswith("."):
             return "Hidden folders in your home hold app settings and can't be synced."
-        return None
+        return platform_mac.home_path_problem(rel) if MAC else None
     if any(path.startswith(root + "/") for root in EXTERNAL_ROOTS):
         return None
     return "Choose a folder inside your home folder or on an external drive."
@@ -100,6 +111,8 @@ def local_path_problem(path):
 
 def overlaps(a, b):
     a, b = os.path.realpath(a), os.path.realpath(b)
+    if MAC:
+        a, b = platform_mac.fold(a), platform_mac.fold(b)
     return a == b or a.startswith(b + "/") or b.startswith(a + "/")
 
 
@@ -214,6 +227,13 @@ class GsyncWindow(Gtk.ApplicationWindow):
         self._refresh_pairs()
         self._check_setup()
         self._build_tray(app)
+        if MAC:  # closing the window only minimizes it, so give quitting a real shortcut
+            accel = Gtk.AccelGroup()
+            key, mods = Gtk.accelerator_parse("<Primary>q")  # <Primary> is ⌘ on macOS
+            accel.connect(key, mods, 0, lambda *_: self._quit() or True)
+            self.add_accel_group(accel)
+            platform_mac.show_handlers.append(
+                lambda: (self.deiconify(), self.present(), platform_mac.activate_app()))
 
         GLib.timeout_add_seconds(30, self._tick)
         self.connect("delete-event", self._on_close)
@@ -302,14 +322,16 @@ class GsyncWindow(Gtk.ApplicationWindow):
         every.pack_start(Gtk.Label(label="min"), False, False, 0)
         grid.attach(every, 1, 0, 1, 1)
         grid.attach(Gtk.Label(label="Start at login", xalign=0), 0, 1, 1, 1)
-        self.sw_auto = Gtk.Switch(active=os.path.exists(AUTOSTART_FILE), halign=Gtk.Align.END)
+        autostart = platform_mac.autostart_enabled() if MAC else os.path.exists(AUTOSTART_FILE)
+        self.sw_auto = Gtk.Switch(active=autostart, halign=Gtk.Align.END)
         self.sw_auto.connect("notify::active", self._on_autostart)
         grid.attach(self.sw_auto, 1, 1, 1, 1)
         grid.attach(Gtk.Separator(), 0, 2, 2, 1)
-        for row, (label, fn) in enumerate(
-            (("Sync all now", lambda *_: self._sync_all()),
-             ("Reconnect Google account", self._on_connect)), start=3
-        ):
+        items = [("Sync all now", lambda *_: self._sync_all()),
+                 ("Reconnect Google account", self._on_connect)]
+        if MAC:
+            items.append(("Quit Gsync (⌘Q)", lambda *_: self._quit()))
+        for row, (label, fn) in enumerate(items, start=3):
             b = Gtk.ModelButton(text=label)
             b.get_child().set_halign(Gtk.Align.START)
             b.connect("clicked", fn)
@@ -469,6 +491,9 @@ class GsyncWindow(Gtk.ApplicationWindow):
         self.indicator.set_menu(menu)
 
     def _on_close(self, *_):
+        if MAC and not self.quitting:
+            self.iconify()  # no tray on macOS: park in the Dock and keep syncing; quit with ⌘Q
+            return True
         if self.indicator and not self.quitting:
             self.hide()  # keep syncing in the background
             return True
@@ -544,14 +569,14 @@ class GsyncWindow(Gtk.ApplicationWindow):
             self.infobar.set_message_type(Gtk.MessageType.ERROR)
             self.banner.set_markup(
                 "<b>rclone is not installed.</b> Install the latest release with:\n"
-                "<tt>curl https://rclone.org/install.sh | sudo bash</tt>"
+                f"<tt>{INSTALL_RCLONE}</tt>"
             )
         elif ver < MIN_RCLONE:
             self.infobar.set_message_type(Gtk.MessageType.WARNING)
             self.banner.set_markup(
                 f"<b>rclone {'.'.join(map(str, ver))} is too old for reliable sync</b> "
                 f"(need {'.'.join(map(str, MIN_RCLONE))} or newer). Update with:\n"
-                "<tt>curl https://rclone.org/install.sh | sudo bash</tt>"
+                f"<tt>{INSTALL_RCLONE}</tt>"
             )
         elif not remote_configured():
             self.infobar.set_message_type(Gtk.MessageType.INFO)
@@ -895,6 +920,8 @@ class GsyncWindow(Gtk.ApplicationWindow):
                 # requests per sync vs 30 with --fast-list (same listing, far fewer rate-limit stalls).
                 "--fast-list",
             ]
+            if MAC:
+                cmd += platform_mac.BISYNC_EXCLUDES
             if resync or not pair["initialized"]:
                 cmd += ["--resync"]  # default resync mode: Path1 (Drive) wins on differences
             self.log_line(f"== {name} ==")
@@ -933,6 +960,9 @@ class GsyncWindow(Gtk.ApplicationWindow):
         save_config(self.cfg)
 
     def _on_autostart(self, sw, _param):
+        if MAC:
+            platform_mac.set_autostart(sw.get_active(), __file__)
+            return
         if sw.get_active():
             os.makedirs(os.path.dirname(AUTOSTART_FILE), exist_ok=True)
             with open(AUTOSTART_FILE, "w") as f:
@@ -960,4 +990,6 @@ class GsyncApp(Gtk.Application):
 
 
 if __name__ == "__main__":
+    if MAC and not platform_mac.claim_single_instance(CFG_DIR):
+        sys.exit(0)  # the running Gsync was asked to show its window
     sys.exit(GsyncApp().run([sys.argv[0]]))

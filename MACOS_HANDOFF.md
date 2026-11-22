@@ -49,4 +49,20 @@ Delete this file before merging `macos` into `main`.
 
 ## Status
 - [x] `macos` branch created from `main` at the commit that added this file's parent.
-- [ ] Phase 1 gate run on the Mac.
+- [x] Phase 1 gate run on the Mac mini (2026-11-22, macOS 26.6.2 arm64, Homebrew Python 3.15.2, GTK 3.24.52, rclone 1.76.0).
+  GTK 3 passes, so no PySide6. Window, icons, message/confirm dialogs, progress dialog with a worker thread,
+  `GLib.idle_add`, folder chooser, Drive picker thread and `Gtk.show_uri_on_window` all work unchanged.
+  Dialogs get native traffic lights; the main window keeps GNOME-style header-bar buttons (cosmetic).
+- [x] Phase 2 platform layer in `platform_mac.py`, with small darwin-guarded hooks in `gsync.py`:
+  PATH fix (launchd/Finder lack `/opt/homebrew/bin`), LaunchAgent autostart (plist only, no `launchctl`,
+  see `set_autostart`), path safety (`~/Library`, Photos/Music/TV library folders, packages,
+  iCloud Desktop & Documents, `/Volumes`, case and NFC folding), `.DS_Store`/`._*` excludes,
+  close = minimize to Dock, ⌘Q and a ☰ Quit item, single-instance lock + socket (GApplication
+  uniqueness needs D-Bus and didn't work: two copies ran).
+  `Gtk.show_uri_on_window` works on macOS, so open-folder needed no change.
+- [x] Phase 4 packaging: `install_mac.sh` (an `osacompile` applet; macOS 26 refuses shell-script bundle
+  executables with LaunchServices error -10669) and `MACOS_TESTING.md`.
+- [ ] Phase 3 safe first sync with a real Drive account: the user does this with their own client ID.
+  Checklist in `MACOS_TESTING.md`.
+- [ ] For `main`: the empty-state page stays blank until the first 30 s tick (`Gtk.Stack` ignores
+  `set_visible_child_name` before `show_all`). Affects Linux too.
