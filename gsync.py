@@ -240,6 +240,9 @@ class GsyncWindow(Gtk.ApplicationWindow):
         if background:
             self.iconify()
         self.show_all()
+        # Gtk.Stack ignores set_visible_child_name() for children that aren't shown yet, so the
+        # choice made by _refresh_pairs() above only takes effect now that show_all() has run.
+        self.stack.set_visible_child_name("pairs" if self.cfg["pairs"] else "empty")
 
     # ---------- UI ----------
     def _build_ui(self):
